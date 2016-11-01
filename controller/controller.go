@@ -73,6 +73,10 @@ const createProvisionedPVInterval = 10 * time.Second
 type ProvisionController struct {
 	client kubernetes.Interface
 
+	// If the controller is running in a 1.4 cluster. Out-of-tree provisioners
+	// aren't officially supported until 1.5
+	is1dot4 bool
+
 	// The name of the provisioner for which this controller dynamically
 	// provisions volumes. The value of annDynamicallyProvisioned and
 	// annStorageProvisioner to set & watch for, respectively
@@ -106,6 +110,7 @@ type ProvisionController struct {
 
 func NewProvisionController(
 	client kubernetes.Interface,
+	is1dot4 bool,
 	resyncPeriod time.Duration,
 	provisionerName string,
 	provisioner Provisioner,
@@ -123,6 +128,7 @@ func NewProvisionController(
 
 	controller := &ProvisionController{
 		client:                        client,
+		is1dot4:                       is1dot4,
 		provisionerName:               provisionerName,
 		provisioner:                   provisioner,
 		eventRecorder:                 eventRecorder,
@@ -239,43 +245,57 @@ func (ctrl *ProvisionController) updateVolume(oldObj, newObj interface{}) {
 }
 
 func (ctrl *ProvisionController) shouldProvision(claim *v1.PersistentVolumeClaim) bool {
-	// TODO do this and remove all code below VolumeName check
-	// https://github.com/kubernetes/kubernetes/pull/30285
-	// if claim.Annotations[annStorageProvisioner] != provisionerName {
-	// 	return false, nil
-	// }
-
 	if claim.Spec.VolumeName != "" {
 		return false
 	}
 
-	claimClass := getClaimClass(claim)
-	classObj, found, err := ctrl.classes.GetByKey(claimClass)
-	if err != nil {
-		glog.Errorf("Error getting StorageClass %q: %v", claimClass, err)
-		return false
-	}
-	if !found {
-		glog.Errorf("StorageClass %q not found", claimClass)
-		return false
-	}
-	class, ok := classObj.(*v1beta1.StorageClass)
-	if !ok {
-		glog.Errorf("Cannot convert object to StorageClass: %+v", classObj)
-		return false
-	}
+	// In 1.5+ this annotation is present and is relied on for getting the claim's
+	// class's provisioner name. In 1.4 there is no annotation to rely on so we
+	// must get the provisioner name ourself
+	if !ctrl.is1dot4 {
+		if !hasAnnotation(claim.ObjectMeta, annStorageProvisioner) {
+			return false
+		}
 
-	if class.Provisioner != ctrl.provisionerName {
-		return false
+		if claim.Annotations[annStorageProvisioner] != ctrl.provisionerName {
+			return false
+		}
+	} else {
+		claimClass := getClaimClass(claim)
+		classObj, found, err := ctrl.classes.GetByKey(claimClass)
+		if err != nil {
+			glog.Errorf("Error getting StorageClass %q: %v", claimClass, err)
+			return false
+		}
+		if !found {
+			glog.Errorf("StorageClass %q not found", claimClass)
+			return false
+		}
+		class, ok := classObj.(*v1beta1.StorageClass)
+		if !ok {
+			glog.Errorf("Cannot convert object to StorageClass: %+v", classObj)
+			return false
+		}
+
+		if class.Provisioner != ctrl.provisionerName {
+			return false
+		}
 	}
 
 	return true
 }
 
 func (ctrl *ProvisionController) shouldDelete(volume *v1.PersistentVolume) bool {
-	// TODO 1.4 we should delete volumeFailed, 1.5 we should not
-	if volume.Status.Phase != v1.VolumeReleased && volume.Status.Phase != v1.VolumeFailed {
-		return false
+	// In 1.5+ we delete only if the volume is in state Released. In 1.4 we must
+	// delete if the volume is in state Failed too.
+	if !ctrl.is1dot4 {
+		if volume.Status.Phase != v1.VolumeReleased {
+			return false
+		}
+	} else {
+		if volume.Status.Phase != v1.VolumeReleased && volume.Status.Phase != v1.VolumeFailed {
+			return false
+		}
 	}
 
 	if volume.Spec.PersistentVolumeReclaimPolicy != v1.PersistentVolumeReclaimDelete {
@@ -324,6 +344,10 @@ func (ctrl *ProvisionController) provisionClaimOperation(claim *v1.PersistentVol
 	}
 	if !found {
 		glog.Errorf("StorageClass %q not found", claimClass)
+		// +  3. It tries to find a StorageClass instance referenced by annotation
+		// +     `claim.Annotations["volume.beta.kubernetes.io/storage-class"]`. If not
+		// +     found, it SHOULD report an error (by sending an event to the claim) and it
+		// +     SHOULD retry periodically with step i.
 		return
 	}
 	storageClass, ok := classObj.(*v1beta1.StorageClass)
@@ -333,8 +357,9 @@ func (ctrl *ProvisionController) provisionClaimOperation(claim *v1.PersistentVol
 	}
 
 	options := VolumeOptions{
-		Capacity:                      claim.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
-		AccessModes:                   claim.Spec.AccessModes,
+		Capacity:    claim.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
+		AccessModes: claim.Spec.AccessModes,
+		// TODO SHOULD be set to `Delete` unless user manually congiures other reclaim policy.
 		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 		PVName:     pvName,
 		Parameters: storageClass.Parameters,

@@ -18,7 +18,6 @@ package main
 
 import (
 	"flag"
-	"os"
 	"strings"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"k8s.io/client-go/1.4/pkg/util/validation"
 	"k8s.io/client-go/1.4/pkg/util/validation/field"
 	"k8s.io/client-go/1.4/pkg/util/wait"
+	"k8s.io/client-go/1.4/pkg/version"
 	"k8s.io/client-go/1.4/rest"
 	"k8s.io/client-go/1.4/tools/clientcmd"
 )
@@ -49,18 +49,15 @@ func main() {
 	flag.Parse()
 
 	if errs := validateProvisioner(*provisioner, field.NewPath("provisioner")); len(errs) != 0 {
-		glog.Errorf("Invalid provisioner specified: %v", errs)
-		os.Exit(1)
+		glog.Fatalf("Invalid provisioner specified: %v", errs)
 	}
 	glog.Infof("Provisioner %s specified", *provisioner)
 
 	if *runServer && !*useGanesha {
-		glog.Errorf("Invalid flags specified: if run-server is true, use-ganesha must also be true.")
-		os.Exit(1)
+		glog.Fatalf("Invalid flags specified: if run-server is true, use-ganesha must also be true.")
 	}
 
 	if *runServer {
-		// Start the NFS server
 		glog.Infof("Starting NFS server!")
 		err := server.Start(ganeshaConfig)
 		if err != nil {
@@ -68,6 +65,7 @@ func main() {
 		}
 	}
 
+	// Create the client according to whether we are running in or out-of-cluster
 	var config *rest.Config
 	var err error
 	if *master != "" || *kubeconfig != "" {
@@ -83,10 +81,22 @@ func main() {
 		glog.Fatalf("Failed to create client: %v", err)
 	}
 
+	// Check if we are running in a 1.4 cluster. The controller needs to know
+	// because out-of-tree provisioners aren't officially supported until 1.5
+	serverVersion, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		glog.Fatalf("Error getting server version.")
+	}
+	gitVersion := version.MustParse(serverVersion.GitVersion)
+	gitVersion1dot5 := version.MustParse("1.5.0")
+	is1dot4 := gitVersion.LT(gitVersion1dot5)
+
+	// Create the provisioner: it implements the Provisioner interface expected by
+	// the controller.
 	nfsProvisioner := vol.NewNFSProvisioner("/export/", clientset, *useGanesha, ganeshaConfig)
 
 	// Start the provision controller which will dynamically provision NFS PVs
-	pc := controller.NewProvisionController(clientset, 15*time.Second, *provisioner, nfsProvisioner)
+	pc := controller.NewProvisionController(clientset, is1dot4, 15*time.Second, *provisioner, nfsProvisioner)
 	pc.Run(wait.NeverStop)
 }
 
